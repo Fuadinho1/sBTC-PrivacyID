@@ -118,3 +118,117 @@
 
         (var-set total-identities (+ (var-get total-identities) u1))
         (ok true)))
+
+(define-public (add-proof
+    (identity-hash (buff 32))
+    (proof (buff 512))
+    (verification-type uint))
+    (let
+        ((identity (unwrap! (map-get? Identities {identity-hash: identity-hash}) ERR-NO-IDENTITY))
+         (sender tx-sender)
+         (proof-hash (sha256 proof)))
+
+        ;; Verify ownership and status
+        (asserts! (is-eq (get owner identity) sender) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status identity) STATUS-ACTIVE) ERR-REVOKED)
+        (asserts! (< stacks-block-height (get expiry-height identity)) ERR-EXPIRED)
+
+        ;; Register proof
+        (map-set ProofRegistry
+            { proof-hash: proof-hash }
+            {
+                identity-hash: identity-hash,
+                verification-type: verification-type,
+                creation-height: stacks-block-height,
+                expiry-height: (get expiry-height identity),
+                is-valid: true
+            })
+
+        (ok proof-hash)))
+
+(define-public (verify-identity
+    (identity-hash (buff 32))
+    (proof-hash (buff 32))
+    (verification-type uint))
+    (let
+        ((identity (unwrap! (map-get? Identities {identity-hash: identity-hash}) ERR-NO-IDENTITY))
+         (proof (unwrap! (map-get? ProofRegistry {proof-hash: proof-hash}) ERR-INVALID-PROOF))
+         (verifier (unwrap! (map-get? Verifiers {verifier: tx-sender}) ERR-UNAUTHORIZED)))
+
+        ;; Verify proof validity
+        (asserts! (is-eq (get identity-hash proof) identity-hash) ERR-INVALID-PROOF)
+        (asserts! (is-eq (get verification-type proof) verification-type) ERR-INVALID-PROOF)
+        (asserts! (get is-valid proof) ERR-VERIFICATION-FAILED)
+        (asserts! (< stacks-block-height (get expiry-height proof)) ERR-EXPIRED)
+
+        ;; Verify verifier authorization
+        (asserts! (get is-active verifier) ERR-UNAUTHORIZED)
+        (asserts! (is-some (index-of (get allowed-types verifier) verification-type)) ERR-INVALID-VERIFIER)
+
+        ;; Update verification stats
+        (map-set Verifiers
+            { verifier: tx-sender }
+            (merge verifier {
+                verifications-performed: (+ (get verifications-performed verifier) u1),
+                last-verification: stacks-block-height
+            }))
+
+        (var-set total-verifications (+ (var-get total-verifications) u1))
+        (ok true)))
+
+(define-public (revoke-identity
+    (identity-hash (buff 32)))
+    (let
+        ((identity (unwrap! (map-get? Identities {identity-hash: identity-hash}) ERR-NO-IDENTITY))
+         (sender tx-sender))
+
+        ;; Verify ownership
+        (asserts! (or 
+            (is-eq sender (get owner identity))
+            (is-eq sender CONTRACT-OWNER)) ERR-UNAUTHORIZED)
+
+        ;; Update identity status
+        (map-set Identities
+            { identity-hash: identity-hash }
+            (merge identity {
+                status: STATUS-REVOKED,
+                revocation-height: (some stacks-block-height)
+            }))
+
+        (ok true)))
+
+;; Verifier Management
+(define-public (register-verifier
+    (verifier principal)
+    (allowed-types (list 10 uint)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+
+        (map-set Verifiers
+            { verifier: verifier }
+            {
+                allowed-types: allowed-types,
+                verifications-performed: u0,
+                last-verification: u0,
+                is-active: true
+            })
+        (ok true)))
+
+;; Read-only functions
+(define-read-only (get-identity-info (identity-hash (buff 32)))
+    (map-get? Identities {identity-hash: identity-hash}))
+
+(define-read-only (get-proof-info (proof-hash (buff 32)))
+    (map-get? ProofRegistry {proof-hash: proof-hash}))
+
+(define-read-only (get-verifier-info (verifier principal))
+    (map-get? Verifiers {verifier: verifier}))
+
+(define-read-only (is-identity-valid
+    (identity-hash (buff 32))
+    (verification-type uint))
+    (let ((identity (unwrap! (map-get? Identities {identity-hash: identity-hash}) false)))
+        (and
+            (is-eq (get status identity) STATUS-ACTIVE)
+            (< stacks-block-height (get expiry-height identity))
+            (is-some (index-of (get verification-types identity) verification-type)))))
